@@ -4,9 +4,6 @@ The below document contains a list of vulnerabilities and simple mistakes that a
 
 This repository is intended to be used as a guide for new and experienced auditors alike. 
 
-# Table of Contents
-[Integer Overflow / Underflow](#integer-overflow)
-
 ## 1: Data
 ### 1.1: Integer overflow / underflow
 
@@ -35,11 +32,84 @@ Solidity version 0.8+ comes with implicit overflow and underflow checks on unsig
 
 ### 1.2: Rounding errors
 
-### 1.3 Decimal interoperability
+Rounding errors occur when there is a lack of precision when performing integer division. This can lead to results being rounded towards zero.
 
-### 1.4: Uninitialized variables
+**Example**
+This is a real life example from a protocol called Yield V2. Here we can see integer division occurs before multiplication, which caused a vulnerability via imprecise accuracy when calculating the `cumulativeBalancesRatio`.
 
-Local/state and storage
+``` solidity
+
+function _update(
+        uint128 baseBalance,
+        uint128 fyBalance,
+        uint112 _baseCached,
+        uint112 _fyTokenCached
+    ) private {
+        ....
+
+            cumulativeBalancesRatio +=
+                (scaledFYTokenCached / _baseCached) *
+                timeElapsed;
+        ....
+    }
+```
+
+**Mitigation**
+In order to prevent rounding errors, a developer should do the following:
+- Multiplication should always occur before division to avoid a loss in precision.
+- Use a flooring division instead of a rounding-towards-zero division.
+- Use a higher precision in the computation of results involving integer division. Specifically, use 1e27 instead of 1e18.
+
+
+### 1.3: Uninitialized variables
+
+Ensure to check for uninitialized state variables. Whilst this on it's own isn't a vlunerability, it can lead to arithmetic errors and unexpected behavior.
+
+### 1.4: Private Data
+
+Just because a state variable is private, this doesn't mean it isn't readable. A smart contract stores state variables in slots, and an attacker can read the value of any storage variable by finding the corresponding slot. 
+
+**Mitigation**
+
+Sensitive information should not be placed in storage, and should instead not be stored in a contract when possible. When necessary, storing a sensitive variable in memory is another possible mitigation. 
+
+### 1.5: Bad Randomness
+
+Solidity smart contracts are deterministic. Therefore it is not possible to create a truly 'random' number within a contract. Often, you will see protocols try to mimic randomness by hashing pseudo-random numbers through the use of global variables such as `block.timestamp`, `msg.sender` and `block.coinbase`. However, if a hacker can determine these values before a transaction is sent, then they can potentially front-run or reverse engineer a generated value. For this vulnerability, context is important. If a large amount of user funds relies on verifiable randomness, then this certainly needs to be mitigated. However, the cost of implementing true randomness may not be worth it for small protocols where the effort to crack pseudo-random number generator outweighs the reward.
+
+**Example**
+``` solidity
+/// This is exploitable
+uint256 pseudoRandom = uint256(keccak256(abi.encodePacked(
+      tx.origin,
+      blockhash(block.number - 1),
+      block.timestamp
+    )));
+```
+
+**Mitigation**
+
+Use oracles to generate truly random numbers that can be applied on-chain. The most common solution is Chainlink VRF, which creates a verifiably random number off-chain and propogates it on-chain.
+
+### 1.6: Unchecked Return Value
+
+Some tokens like USDT don't correctly implement the EIP20 standard, and their `transfer` / `transferFrom` function calls return `void` instead of a boolean. Thus, calling these functions with the correct EIP20 function signatures will always revert unless the return type is explicitly checked. 
+
+Additionally, the `call` and `send` functions return a Boolean indicating whether the call succeeded or failed. Thus, if the call is not checked, execution will resume even if the call threw an exception. This can lead to an attacker forcing the call to fail, but still being able to update some state in a contract.
+
+**Mitigation**
+
+Explicitly check for the return value of calls. For the transferring of tokens, it is advised to use OpenZeppelin's SafeERC20 library.
+
+``` solidity
+/// Correctly check the return value of an external call
+(bool success, bytes memory data) = _addr.call{value: msg.value, gas: 5000}();
+require(success, "Call failed");
+
+/// Safely transfer an ERC20
+ERC20(this).safeTransferFrom(msg.sender, to, amount);
+```
+
 
 ## 2: Standard
 
@@ -61,9 +131,6 @@ Local/state and storage
 
 ### 2.9: Correct function visibility
 
-
-### 
-
 ## 3: Dependencies
 
 ### 3.1: Unaudited dependency
@@ -84,4 +151,85 @@ Local/state and storage
 
 Check bounds and presence of arguments
 
-### 4.5: 
+## 5: Low-Level Calls
+
+### 5.1: Self Destruct
+
+Malicious parties can use the `selfdestruct` method of a contract to force ether to another contract. If the exploited contract uses `address(this).balance` to perform some check, this call would increase this value past the expected amount. This can cause enexpected errors in logic and allows attackers to circumvent certain checks.
+
+**Example**
+In this example, users can only deposit 0.5 eth, and the person who deposits at the target amount wins the whole pot. Here, we can use `selfdestruct` to force the Vulnerable.sol contract to receive ether, which is then checked and thus the game logic is avoided.
+``` solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.15;
+
+contract Vulnerable {
+  uint public targetBalance = 7 ether;
+  address public winner;
+
+  function deposit() public payable {
+    require(msg.value == 0.5 ether, "Have to send exactly 0.5 eth");
+    uint balance = address(this.balance);
+    require(balance <= targetBalance, "Game is over");
+
+    if (balance == targetBalance) {
+      winner = msg.sender;
+    }
+  }
+}
+
+
+contract Attack {
+
+  function attack(address force) public payable {
+    selfdestruct(payable(force)); // send 7 ether
+  }    
+}  
+```
+
+**Mitigation**
+Don't use `address(this).balance`. Instead, use a state variable to track the balances of users (or whatever balance is being tracked).
+
+### 5.2: Unsafe Delegatecall
+
+`delegatecall` preserves the context of the caller at runtime. Thus, the values of `msg.sender`, `msg.data` and `msg.value` don't change - unlike `call` where those value might change during execution. Additionally, the storage layout of both the Caller and Receiver should be the same. This can create security vulnerabilities, as an attacker can manipulate a delegation contract to unintentionally invoke a `delegatecall` using the attacker's state.
+
+**Example**
+Below is an example of how an attacker can manipulate the `Delegation` contract to call the `Delegate.pwn()` function to set themselves as the new owner. They do this by passing the function selector of `pwn()` in the calldata. Since the `Delegation` contract has no function that matches this selecter, it catches the error using the fallback function. This calls the `Delegate.pwn()` function in the context of the attacker.
+
+``` solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.6.0;
+
+contract Delegate {
+    address public owner;
+
+    constructor(address _owner) public {
+        owner = _owner;
+    }
+
+    function pwn() public {
+        owner = msg.sender;
+    }
+}
+
+contract Delegation {
+    address public owner;
+    Delegate delegate;
+
+    constructor(address _delegateAddress) public {
+        delegate = Delegate(_delegateAddress);
+        owner = msg.sender;
+    }
+
+    fallback() external {
+        (bool result,) = address(delegate).delegatecall(msg.data);
+        if (result) {
+            this;
+        }
+    }
+}
+```
+
+**Mitigation**
+The common example of the `delegatecall` vulnerability can be prevented by using a stateless library (ie. a library contract that only exposes `pure` or `view` functions and doesn't modify state in client contracts).
